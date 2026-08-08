@@ -1,0 +1,63 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Coverage and test output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit.xml
+.tox/
+.nox/
+
+# Packaging and build output
+build/
+dist/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# OS-generated files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+Thumbs.db
+Desktop.ini
+
+autoPWD.txt
