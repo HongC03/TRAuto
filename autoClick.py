@@ -3,6 +3,7 @@
 Copy this file, set TARGET_IMAGE_NAME and the desired action, then implement any
 extra behavior in run_task_step(). Keep each step short so GameSupervisor can
 check the game and handle OCR frequently.
+
 """
 
 import time
@@ -12,6 +13,7 @@ import pydirectinput
 
 LOOP_INTERVAL = 0.5
 
+
 def main():
     while True:
         if keyboard.is_pressed("f12"):
@@ -19,6 +21,8 @@ def main():
             break
 
         pydirectinput.click()
+        pydirectinput.keyDown("enter")
+        pydirectinput.keyUp("enter")
         time.sleep(LOOP_INTERVAL)
 
 

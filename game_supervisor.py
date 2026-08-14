@@ -16,7 +16,7 @@ import pyautogui as gui
 import pydirectinput as key
 import pygetwindow as gw
 
-from utils import pressButton, triggerIfDetected
+from utils import locate_on_screen, pressButton, triggerIfDetected
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -74,8 +74,8 @@ def frontWindow(window):
         time.sleep(0.5)
 
 
-def itemExpired():
-    if triggerIfDetected(asset("cross.png")):
+def itemExpired(region=None):
+    if triggerIfDetected(asset("cross.png"), region=region):
         print("* 已按下紅叉 *")
         time.sleep(1)
         return True
@@ -89,7 +89,7 @@ def getOcr():
     return _ocr
 
 
-def stateYZM(find):
+def stateYZM(find, region=None):
     """Recognize and enter the two-digit verification code."""
     print("")
     key.moveTo(10, 10)
@@ -130,7 +130,11 @@ def stateYZM(find):
         print("* 驗證碼辨識失敗，輸入 01 以重試 *")
 
     for digit in digits:
-        number_pos = gui.locateOnScreen(asset(f"num{digit}.png"), confidence=0.89)
+        number_pos = locate_on_screen(
+            asset(f"num{digit}.png"),
+            confidence=0.89,
+            region=region,
+        )
         if number_pos is not None:
             pressButton(number_pos)
         else:
@@ -144,20 +148,28 @@ def stateYZM(find):
     print("")
 
 
-def clearPrompt():
+def clearPrompt(region=None):
     """Clear prompts and return whether any blocker was handled."""
     handled = False
-    verification_pos = gui.locateOnScreen(asset("yzm1.png"), confidence=0.89)
+    verification_pos = locate_on_screen(
+        asset("yzm1.png"),
+        confidence=0.89,
+        region=region,
+    )
     if verification_pos is not None:
-        stateYZM(verification_pos)
+        stateYZM(verification_pos, region=region)
         handled = True
 
-    if itemExpired():
+    if itemExpired(region=region):
         handled = True
-    if triggerIfDetected(asset("okButton.png"), action="click"):
+    if triggerIfDetected(
+        asset("okButton.png"), action="click", region=region
+    ):
         print('* 已發現並按下“確認”鍵 *')
         handled = True
-    if triggerIfDetected(asset("denyInvite.png"), action="click"):
+    if triggerIfDetected(
+        asset("denyInvite.png"), action="click", region=region
+    ):
         print('* 已發現並按下“取消”鍵 *')
         handled = True
     return handled
@@ -258,7 +270,13 @@ def restartGame(account, password):
 class GameSupervisor:
     """Own optional game startup, restart detection, and prompt/OCR handling."""
 
-    def __init__(self, account="", password="", auto_start=False):
+    def __init__(
+        self,
+        account="",
+        password="",
+        auto_start=False,
+        screen_region=None,
+    ):
         if auto_start and (not account or not password):
             raise ValueError(
                 "啟用 auto_start 時必須提供 account 與 password"
@@ -267,16 +285,18 @@ class GameSupervisor:
         self.account = account
         self.password = password
         self.auto_start = auto_start
+        self.screen_region = screen_region
         key.FAILSAFE = False
         gui.FAILSAFE = False
         key.PAUSE = 0.02
 
     @classmethod
-    def from_config(cls, auto_start=False):
+    def from_config(cls, auto_start=False, screen_region=None):
         """Create a supervisor, loading required credentials for auto-start."""
         return cls(
             *readCredentials(required=auto_start),
             auto_start=auto_start,
+            screen_region=screen_region,
         )
 
     def ensure_ready(self):
@@ -291,15 +311,17 @@ class GameSupervisor:
 
         frontWindow(windows[0])
         if self.auto_start:
-            offline_pos = gui.locateOnScreen(
-                asset("offline.png"), confidence=0.89
+            offline_pos = locate_on_screen(
+                asset("offline.png"),
+                confidence=0.89,
+                region=self.screen_region,
             )
             if offline_pos is not None:
                 print("** 偵測到斷線，自動重新啟動 **")
                 restartGame(self.account, self.password)
                 return "restarted"
 
-        clearPrompt()
+        clearPrompt(region=self.screen_region)
         return "ready"
 
     def run_forever(self, interval=CHECK_INTERVAL):

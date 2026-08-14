@@ -28,27 +28,57 @@ from urllib.request import Request, urlopen
 
 import pyautogui as gui
 import pydirectinput as key
+import pygetwindow as gw
 
 from event_script.farm_workflow import FarmWorkflow, FarmWorkflowConfig
-from game_supervisor import BASE_DIR, GameSupervisor, clearPrompt, gameWindows
+from game_supervisor import (
+    BASE_DIR,
+    GameSupervisor,
+    clearPrompt,
+    frontWindow,
+    gameWindows,
+)
+from utils import (
+    autoPressButton,
+    locate_on_screen,
+    pressButton,
+    triggerIfDetected,
+)
 
+
+# Paths and output.
 FARM_SCREEN_RECORDING_OUTPUT_DIR = BASE_DIR / "farm_screen_recordings"
-from utils import autoPressButton, pressButton, triggerIfDetected
+STARTUP_SCREENSHOT_OUTPUT_DIR = BASE_DIR / "startup_screenshots"
+FARM_CLICK_POSITIONS_PATH = BASE_DIR / "farm_click_positions.json"  # Saved Shift clicks.
+ALARM_WINDOW_SCRIPT_PATH = BASE_DIR / "event_script" / "alarm_window.py"  # Alarm CLI.
+CONAN_STATS_PATH = BASE_DIR / "conan_stats.json"  # Persistent Conan statistics file.
 
-
+# Conan detection and actions.
 TARGET_IMAGE_NAME = "conan.png"  # Template for starting a Conan task.
 ACTION = "click"  # Action for TARGET_IMAGE_NAME: "click" or "key".
 KEYBOARD_KEY = None  # Key to press when ACTION is "key"; otherwise unused.
 MATCH_CONFIDENCE = 0.89  # Minimum image-match confidence for all screen templates.
 MATCH_END_IMAGE_NAME = "conan_end.png"  # Template marking a finished Conan task.
+EXPIRED_IMAGE_NAME = "expired.png"  # Template marking an expired item prompt.
+
+# Main-loop timing and window behavior.
 MATCH_END_WAIT_SECONDS = 20  # Grace period after Conan ends before farm starts.
-LOOP_INTERVAL = 5  # Seconds between general Conan-loop checks.
+LOOP_INTERVAL = 3  # Seconds between general Conan-loop checks.
+SWITCH_TO_PREVIOUS_WINDOW_ENABLED = False  # Use Alt+Tab after each loop.
+SWITCH_TO_PREVIOUS_WINDOW_METHOD = "alt_tab"  # "alt_tab" Or "previous_window".
 SHIFT_RANDOM_INTERVAL = 3  # Optional +/- jitter in automatic Conan Shift presses.
+
+# Feature flags and diagnostics.
 FARM_WORKFLOW_ENABLED = True  # Enable scheduled farm runs during Conan automation.
 FARM_SCREEN_RECORDING_ENABLED = False  # Record farm runs as MP4 when enabled.
+STARTUP_SCREENSHOT_ENABLED = True  # Save one primary-monitor PNG when Conan starts.
+
+# Screen-recording settings.
 FARM_SCREEN_RECORDING_FPS = 10.0  # Automatic farm-video frame rate.
+
+# Farm schedule and image workflow.
 SCHEDULED_IMAGE_NAME = "farm/farm.png"  # First template that opens the farm flow.
-SCHEDULED_IMAGE_INTERVAL_SECONDS = 1800  # Secondsxzxx between completed farm schedules.
+SCHEDULED_IMAGE_INTERVAL_SECONDS = 1800  # Seconds between completed farm schedules.
 SCHEDULED_IMAGE_TIMEOUT_SECONDS = 20  # Maximum seconds to wait for one farm target.
 FARM_ENTRY_IMAGE_NAMES = ("yes.png", "farm/enter_my_farm.png")  # Farm entry clicks.
 CROPS_START_BUTTON_IMAGE = "farm/crops_management.png"  # Opens crop management.
@@ -93,27 +123,71 @@ FARM_WORKFLOW_CONFIG = FarmWorkflowConfig(
     purchase_image_names=FARM_PURCHASE_IMAGE_SEQUENCE,
     return_image_names=FARM_RETURN_IMAGE_SEQUENCE,
 )
-FARM_CLICK_POSITIONS_PATH = BASE_DIR / "farm_click_positions.json"  # Saved Shift clicks.
+
+# Farm step timing.
 FARM_STEP_POLL_INTERVAL_SECONDS = 0.5  # Seconds between farm template searches.
 FARM_TARGET_FIELD_DELAY_SECONDS = 3  # Pause after field.png before target_field.png.
 CROP_COLLECTION_CONFIRMATION_DELAY_SECONDS = 3  # Wait before crop OK.
 FARM_PURCHASE_STEP_DELAY_SECONDS = 1  # Pause between purchase actions.
 FARM_SHIFT_CLICK_DELAY_SECONDS = 0.3 # Seconds between recorded Shift-click positions.
 FARM_STEP_RETRIES = 2  # Total attempts for every actionable farm step.
+
+# Telegram and alarm settings.
 TELEGRAM_POLL_TIMEOUT = 5  # Telegram long-poll timeout in seconds.
 TELEGRAM_RETRY_DELAY = 5  # Delay before retrying failed Telegram polling.
 ALARM_WINDOW_DEFAULT_INTERVAL_SECONDS = 60  # Default recurring desktop alarm period.
 ALARM_WINDOW_DEFAULT_TITLE = ""  # Default title for Telegram-started alarm windows.
 ALARM_WINDOW_DEFAULT_MESSAGE = "The alarm interval has elapsed."  # Alarm text.
-ALARM_WINDOW_SCRIPT_PATH = BASE_DIR / "event_script" / "alarm_window.py"  # Alarm CLI.
-CONAN_STATS_PATH = BASE_DIR / "conan_stats.json"  # Persistent Conan statistics file.
 
 
 gui.useImageNotFoundException(False)
 
 
-def switch_to_previous_window():
-    """Briefly switch to the previously active Windows window."""
+def get_active_window():
+    """Return the currently focused window, if the desktop exposes one."""
+    try:
+        return gw.getActiveWindow()
+    except (OSError, TypeError, AttributeError):
+        return None
+
+
+def is_game_window(window):
+    """Return whether a window is one of the current Tales Runner windows."""
+    if window is None:
+        return False
+    try:
+        for game_window in gameWindows():
+            if window is game_window:
+                return True
+            window_handle = getattr(window, "_hWnd", None)
+            game_handle = getattr(game_window, "_hWnd", None)
+            if (
+                window_handle is not None
+                and game_handle is not None
+                and window_handle == game_handle
+            ):
+                return True
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return False
+    return False
+
+
+def switch_to_previous_window(previous_window=None):
+    """Focus the configured post-loop window-switch target."""
+    if not SWITCH_TO_PREVIOUS_WINDOW_ENABLED:
+        return False
+
+    if SWITCH_TO_PREVIOUS_WINDOW_METHOD == "previous_window":
+        if previous_window is None or is_game_window(previous_window):
+            return False
+        frontWindow(previous_window)
+        return True
+    if SWITCH_TO_PREVIOUS_WINDOW_METHOD != "alt_tab":
+        raise ValueError(
+            "SWITCH_TO_PREVIOUS_WINDOW_METHOD must be 'alt_tab' "
+            "or 'previous_window'"
+        )
+
     key.keyDown("alt")
     try:
         key.keyDown("tab")
@@ -121,6 +195,7 @@ def switch_to_previous_window():
         time.sleep(0.25)
     finally:
         key.keyUp("alt")
+    return True
 
 
 def load_dotenv_file():
@@ -861,12 +936,54 @@ def match_end_image_path():
     return BASE_DIR / "scr" / MATCH_END_IMAGE_NAME
 
 
+def expired_image_path():
+    return BASE_DIR / "scr" / EXPIRED_IMAGE_NAME
+
+
 def scheduled_image_path():
     return BASE_DIR / "scr" / SCHEDULED_IMAGE_NAME
 
 
 def farm_image_path(image_name):
     return BASE_DIR / "scr" / image_name
+
+
+def locate_on_primary_screen(image_path, confidence=MATCH_CONFIDENCE):
+    """Locate an image on the primary screen."""
+    return locate_on_screen(
+        image_path,
+        confidence=confidence,
+    )
+
+
+def clear_expired_prompt():
+    """Dismiss an expired-item prompt before the next automation action."""
+    image_path = expired_image_path()
+    if not image_path.is_file():
+        return True
+
+    try:
+        expired_position = locate_on_primary_screen(image_path)
+    except (OSError, TypeError, ValueError):
+        return True
+    if expired_position is None:
+        return True
+
+    for image_name in FARM_CROSS_IMAGE_NAMES:
+        cross_path = farm_image_path(image_name)
+        if not cross_path.is_file():
+            continue
+        try:
+            cross_position = locate_on_primary_screen(cross_path)
+        except (OSError, TypeError, ValueError):
+            continue
+        if cross_position is not None:
+            pressButton(cross_position)
+            print(f"* 偵測到 {EXPIRED_IMAGE_NAME}，已點擊 {image_name} *")
+            return True
+
+    print(f"* 偵測到 {EXPIRED_IMAGE_NAME}，等待關閉按鈕 *")
+    return False
 
 
 def validate_configuration(
@@ -946,10 +1063,7 @@ def _wait_for_any_farm_image_result(
             return None
 
         for image_name, image_path in image_paths:
-            position = gui.locateOnScreen(
-                str(image_path),
-                confidence=MATCH_CONFIDENCE,
-            )
+            position = locate_on_primary_screen(image_path)
             if position is not None:
                 elapsed = time.monotonic() - started_at
                 print(f"* 找到農場圖片: {image_path.name}（{elapsed:.1f} 秒）*")
@@ -1000,6 +1114,8 @@ def wait_for_farm_image_then_click(
     )
     if position is None:
         return False
+    if not clear_expired_prompt():
+        return False
     pressButton(position)
     print(f"* 已點擊農場圖片 {image_name} *")
     return True
@@ -1016,6 +1132,8 @@ def wait_for_any_farm_image_then_click(
     )
     if position is None:
         return False
+    if not clear_expired_prompt():
+        return False
     pressButton(position)
     print(f"* 已點擊農場圖片之一: {', '.join(image_names)} *")
     return True
@@ -1027,10 +1145,7 @@ def is_farm_image_visible(image_name):
     if not image_path.is_file():
         return False
     try:
-        visible = gui.locateOnScreen(
-            str(image_path),
-            confidence=MATCH_CONFIDENCE,
-        ) is not None
+        visible = locate_on_primary_screen(image_path) is not None
     except (OSError, TypeError, ValueError):
         return False
     if visible:
@@ -1168,6 +1283,8 @@ def run_farm_step_with_retry(
             f"* 農場步驟開始: {description} "
             f"（第 {attempt + 1}/{FARM_STEP_RETRIES} 次）*"
         )
+        if not clear_expired_prompt():
+            continue
         if operation():
             print(f"* 農場步驟成功: {description} *")
             return True
@@ -1242,6 +1359,8 @@ def clear_prompts_until_unblocked(stop_event=None, pause_event=None):
         ):
             print("* 清除農場阻塞提示已取消 *")
             return False
+        if not clear_expired_prompt():
+            return False
         if not clearPrompt():
             print("* 農場阻塞提示已清除 *")
             return True
@@ -1276,6 +1395,26 @@ def stop_farm_screen_recording(recorder):
         print(f"* 農場錄影儲存失敗: {error} *")
         return None
     print(f"* 農場錄影已儲存: {output_path} *")
+    return output_path
+
+
+def save_startup_screenshot():
+    """Save one primary-monitor screenshot at startup when enabled."""
+    if not STARTUP_SCREENSHOT_ENABLED:
+        return None
+    try:
+        screenshot = gui.screenshot()
+        STARTUP_SCREENSHOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_path = (
+            STARTUP_SCREENSHOT_OUTPUT_DIR
+            / f"conan_startup_{timestamp}.png"
+        )
+        screenshot.save(output_path)
+    except Exception as error:
+        print(f"* 啟動截圖儲存失敗，繼續執行 Conan: {error} *")
+        return None
+    print(f"* Conan 啟動截圖已儲存: {output_path} *")
     return output_path
 
 
@@ -1378,11 +1517,14 @@ def run_pending_farm_workflow_if_match_finished(
 
 def run_task_step(status=None):
     """Detect and trigger the Conan task-start image."""
+    if not clear_expired_prompt():
+        return False
     triggered = triggerIfDetected(
         target_image_path(),
         action=ACTION,
         keyboard_key=KEYBOARD_KEY,
         confidence=MATCH_CONFIDENCE,
+        region=None,
     )
     if triggered:
         print(f"* 已觸發 {TARGET_IMAGE_NAME} 的任務動作 *")
@@ -1395,10 +1537,7 @@ def is_match_end_visible():
     if not image_path.is_file():
         return False
     try:
-        return gui.locateOnScreen(
-            str(image_path),
-            confidence=MATCH_CONFIDENCE,
-        ) is not None
+        return locate_on_primary_screen(image_path) is not None
     except (OSError, TypeError, ValueError):
         return False
 
@@ -1477,6 +1616,7 @@ def parse_args(argv=None):
 
 def main(test_farm_workflow=False, record_farm_video=None):
     load_dotenv_file()
+    save_startup_screenshot()
     if record_farm_video is None:
         record_farm_video = FARM_SCREEN_RECORDING_ENABLED
     farm_required = FARM_WORKFLOW_ENABLED or test_farm_workflow
@@ -1486,12 +1626,18 @@ def main(test_farm_workflow=False, record_farm_video=None):
         require_farm=farm_required,
     )
     if test_farm_workflow:
+        persistent_stats = PersistentConanStats(CONAN_STATS_PATH)
         print("* 執行單次農場流程測試 *")
         completed = run_farm_workflow(record_video=record_farm_video)
+        if completed:
+            schedule_next_farm_run(persistent_stats)
+            print("* 農場流程測試成功，已更新下一次農場時間 *")
         print("* 農場流程測試完成 *" if completed else "* 農場流程測試失敗 *")
         return 0 if completed else 1
 
-    supervisor = GameSupervisor.from_config()
+    supervisor = GameSupervisor.from_config(
+        screen_region=None,
+    )
     persistent_stats = PersistentConanStats(CONAN_STATS_PATH)
     persistent_stats.record_run_started()
     status = ConanStatus(persistent_stats)
@@ -1530,6 +1676,14 @@ def main(test_farm_workflow=False, record_farm_video=None):
 
     try:
         while not stop_event.is_set():
+            previous_window = (
+                get_active_window()
+                if SWITCH_TO_PREVIOUS_WINDOW_METHOD == "previous_window"
+                else None
+            )
+            if not clear_expired_prompt():
+                stop_event.wait(LOOP_INTERVAL)
+                continue
             if pause_event.is_set():
                 shift_stop_event.set()
                 status.set_stage(ConanStage.PAUSED_BY_COMMAND)
@@ -1631,8 +1785,8 @@ def main(test_farm_workflow=False, record_farm_video=None):
                 status.set_game_paused(game_state)
                 print(f"* 遊戲狀態為 {game_state}，任務已暫停 *")
 
-            if not stop_event.is_set():
-                switch_to_previous_window()
+            if SWITCH_TO_PREVIOUS_WINDOW_ENABLED and not stop_event.is_set():
+                switch_to_previous_window(previous_window)
             stop_event.wait(LOOP_INTERVAL)
     finally:
         shift_stop_event.set()

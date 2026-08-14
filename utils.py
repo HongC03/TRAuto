@@ -7,6 +7,20 @@ import pyautogui as gui
 import pydirectinput as key
 
 
+def locate_on_screen(image_path, confidence=0.89, region=None):
+    """Locate an image on the primary screen or an optional region."""
+    if region is None:
+        return gui.locateOnScreen(
+            str(image_path),
+            confidence=confidence,
+        )
+    return gui.locateOnScreen(
+        str(image_path),
+        confidence=confidence,
+        region=region,
+    )
+
+
 def _validatePolling(timeout, interval):
     if timeout < 0:
         raise ValueError("timeout 必須大於或等於 0")
@@ -88,7 +102,13 @@ def waitForImageToDisappear(
         time.sleep(min(interval, remaining))
 
 
-def triggerIfDetected(image_path, action="click", keyboard_key=None, confidence=0.89):
+def triggerIfDetected(
+    image_path,
+    action="click",
+    keyboard_key=None,
+    confidence=0.89,
+    region=None,
+):
     """Trigger a mouse click or key press when an image is visible.
 
     Args:
@@ -105,7 +125,11 @@ def triggerIfDetected(image_path, action="click", keyboard_key=None, confidence=
     if action == "key" and not keyboard_key:
         raise ValueError("當 action 為 'key' 時，必須設定 keyboard_key")
 
-    button_position = gui.locateOnScreen(str(image_path), confidence=confidence)
+    button_position = locate_on_screen(
+        image_path,
+        confidence=confidence,
+        region=region,
+    )
     if button_position is None:
         return False
 

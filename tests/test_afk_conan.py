@@ -32,6 +32,14 @@ class WindowFocusTests(unittest.TestCase):
         events = []
 
         with patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_ENABLED",
+            True,
+        ), patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_METHOD",
+            "alt_tab",
+        ), patch.object(
             afk_conan.key,
             "keyDown",
             side_effect=lambda key_name: events.append(("down", key_name)),
@@ -56,6 +64,100 @@ class WindowFocusTests(unittest.TestCase):
                 ("up", "alt"),
             ],
         )
+
+    def test_switch_to_previous_window_can_be_disabled(self):
+        with patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_ENABLED",
+            False,
+        ), patch.object(afk_conan.key, "keyDown") as key_down, patch.object(
+            afk_conan.key,
+            "keyUp",
+        ) as key_up:
+            switched = afk_conan.switch_to_previous_window()
+
+        self.assertFalse(switched)
+        key_down.assert_not_called()
+        key_up.assert_not_called()
+
+    def test_switch_to_previous_window_can_restore_captured_window(self):
+        previous_window = object()
+
+        with patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_ENABLED",
+            True,
+        ), patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_METHOD",
+            "previous_window",
+        ), patch.object(afk_conan, "frontWindow") as front_window:
+            switched = afk_conan.switch_to_previous_window(previous_window)
+
+        self.assertTrue(switched)
+        front_window.assert_called_once_with(previous_window)
+
+    def test_switch_to_previous_window_skips_when_captured_window_is_the_game(self):
+        game_window = object()
+
+        with patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_ENABLED",
+            True,
+        ), patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_METHOD",
+            "previous_window",
+        ), patch.object(
+            afk_conan,
+            "gameWindows",
+            return_value=[game_window],
+        ), patch.object(afk_conan, "frontWindow") as front_window:
+            switched = afk_conan.switch_to_previous_window(game_window)
+
+        self.assertFalse(switched)
+        front_window.assert_not_called()
+
+
+class ExpiredPromptTests(unittest.TestCase):
+    def test_expired_prompt_clicks_the_first_available_close_button(self):
+        expired_position = object()
+        cross_position = object()
+        image_path = Path(__file__)
+
+        with patch.object(
+            afk_conan,
+            "expired_image_path",
+            return_value=image_path,
+        ), patch.object(
+            afk_conan,
+            "farm_image_path",
+            return_value=image_path,
+        ), patch.object(
+            afk_conan.gui,
+            "locateOnScreen",
+            side_effect=[expired_position, cross_position],
+        ), patch.object(afk_conan, "pressButton") as press_button:
+            can_continue = afk_conan.clear_expired_prompt()
+
+        self.assertTrue(can_continue)
+        press_button.assert_called_once_with(cross_position)
+
+    def test_farm_step_checks_expiration_before_running_action(self):
+        events = []
+
+        with patch.object(
+            afk_conan,
+            "clear_expired_prompt",
+            side_effect=lambda: events.append("expired") or True,
+        ):
+            completed = afk_conan.run_farm_step_with_retry(
+                "test",
+                lambda: events.append("action") or True,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(events, ["expired", "action"])
 
 
 class FakeResponse(io.BytesIO):
@@ -393,6 +495,8 @@ class ConanStatusTests(unittest.TestCase):
         with patch.object(afk_conan, "load_dotenv_file"), \
             patch.object(afk_conan, "validate_configuration") as validate, \
             patch.object(afk_conan, "run_farm_workflow", return_value=True) as workflow, \
+            patch.object(afk_conan, "PersistentConanStats") as stats, \
+            patch.object(afk_conan, "schedule_next_farm_run") as schedule, \
             patch.object(afk_conan.GameSupervisor, "from_config") as supervisor:
             exit_code = afk_conan.main(test_farm_workflow=True)
 
@@ -403,6 +507,8 @@ class ConanStatusTests(unittest.TestCase):
             require_farm=True,
         )
         workflow.assert_called_once_with(record_video=False)
+        stats.assert_called_once_with(afk_conan.CONAN_STATS_PATH)
+        schedule.assert_called_once_with(stats.return_value)
         supervisor.assert_not_called()
 
     def test_parse_args_recognizes_farm_video_flags(self):
