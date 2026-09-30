@@ -79,6 +79,50 @@ class GameSupervisorStateTests(unittest.TestCase):
 
         self.assertTrue(handled)
 
+    def test_accept_friend_request_clicks_accept_button(self):
+        with patch.object(
+            game_supervisor,
+            "locate_on_screen",
+            return_value=(100, 100, 20, 20),
+        ), patch.object(
+            game_supervisor, "triggerIfDetected", return_value=True
+        ) as trigger:
+            accepted = game_supervisor.acceptFriendRequest()
+
+        self.assertTrue(accepted)
+        trigger.assert_called_once_with(
+            game_supervisor.asset("accept_button.png"),
+            action="click",
+            region=None,
+        )
+
+    def test_clear_prompt_checks_friend_request_before_closing_prompts(self):
+        with patch.object(
+            game_supervisor, "acceptFriendRequest", return_value=True
+        ) as accept_friend_request, patch.object(
+            game_supervisor.gui, "locateOnScreen", return_value=None
+        ), patch.object(
+            game_supervisor, "itemExpired"
+        ) as item_expired:
+            handled = game_supervisor.clearPrompt()
+
+        self.assertTrue(handled)
+        accept_friend_request.assert_called_once_with(region=None)
+        item_expired.assert_not_called()
+
+    def test_clear_prompt_does_not_close_an_unaccepted_friend_request(self):
+        with patch.object(
+            game_supervisor, "acceptFriendRequest", return_value=False
+        ), patch.object(
+            game_supervisor.gui, "locateOnScreen", return_value=None
+        ), patch.object(
+            game_supervisor, "itemExpired"
+        ) as item_expired:
+            handled = game_supervisor.clearPrompt()
+
+        self.assertFalse(handled)
+        item_expired.assert_not_called()
+
     def test_missing_window_waits_when_auto_start_is_off(self):
         supervisor = game_supervisor.GameSupervisor("", "")
 

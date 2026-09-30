@@ -1,10 +1,10 @@
 {
-  "total_runs": 66,
-  "total_matches_finished": 510,
+  "total_runs": 342,
+  "total_matches_finished": 5589,
   "total_restarts": 0,
-  "total_runtime_seconds": 178279.0973303001,
-  "last_started_at": "2026-08-14 02:00:04",
-  "last_match_at": "2026-08-14 02:33:35",
-  "telegram_update_offset": 998788913,
-  "next_farm_at": 1786646832.706514
+  "total_runtime_seconds": 1675939.1836050004,
+  "last_started_at": "2026-09-30 21:58:53",
+  "last_match_at": "2026-09-30 23:02:03",
+  "telegram_update_offset": 998788942,
+  "next_farm_at": 1790780897.1573102
 }

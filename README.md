@@ -34,6 +34,8 @@ Commands from the configured chat:
 /conanPause
 /conanResume
 /conanStop
+/trLaunch 1
+/trLaunch 2
 /alarmWindow [interval_seconds] [HH:MM] [message]
 /alarmWindow status
 /alarmWindow stop
@@ -42,6 +44,12 @@ Commands from the configured chat:
 `/conanScreenshot` sends the current screen. `/conanStats` reports session and
 all-time statistics. `/conanPause`, `/conanResume`, and `/conanStop` control the
 automation process.
+
+`/trLaunch 1` or `/trLaunch 2` starts the TalesRunner launcher automation with
+the selected login profile. It uses the standalone project at
+`Desktop/ai-agent-workspace/TalesRunner-launcher-auto` and opens it in a new
+PowerShell terminal that remains open for debugging logs. Set
+`TALESRUNNER_LAUNCHER_AUTO_DIR` in `.env` to override that project path.
 
 `/alarmWindow` starts a recurring alarm. The interval is in seconds, the
 optional start time is HKT (`HH:MM`), and the remaining text is the alarm

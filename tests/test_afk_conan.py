@@ -27,6 +27,48 @@ if "PIL" not in sys.modules:
 afk_conan = importlib.import_module("event_script.afk_conan")
 
 
+class RunConfigurationSettingsTests(unittest.TestCase):
+    def test_loop_interval_uses_the_default_when_not_configured(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                afk_conan.environment_positive_float("CONAN_LOOP_INTERVAL", 3), 3
+            )
+
+    def test_loop_interval_accepts_a_pycharm_environment_value(self):
+        with patch.dict(os.environ, {"CONAN_LOOP_INTERVAL": "0.5"}, clear=True):
+            self.assertEqual(
+                afk_conan.environment_positive_float("CONAN_LOOP_INTERVAL", 3), 0.5
+            )
+
+    def test_loop_interval_rejects_non_positive_values(self):
+        with patch.dict(os.environ, {"CONAN_LOOP_INTERVAL": "0"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "greater than zero"):
+                afk_conan.environment_positive_float("CONAN_LOOP_INTERVAL", 3)
+
+    def test_window_switch_accepts_a_pycharm_environment_value(self):
+        with patch.dict(
+            os.environ,
+            {"CONAN_SWITCH_TO_PREVIOUS_WINDOW_ENABLED": "true"},
+            clear=True,
+        ):
+            self.assertTrue(
+                afk_conan.environment_boolean(
+                    "CONAN_SWITCH_TO_PREVIOUS_WINDOW_ENABLED", False
+                )
+            )
+
+    def test_window_switch_rejects_invalid_values(self):
+        with patch.dict(
+            os.environ,
+            {"CONAN_SWITCH_TO_PREVIOUS_WINDOW_ENABLED": "maybe"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "true, false"):
+                afk_conan.environment_boolean(
+                    "CONAN_SWITCH_TO_PREVIOUS_WINDOW_ENABLED", False
+                )
+
+
 class WindowFocusTests(unittest.TestCase):
     def test_switch_to_previous_window_uses_a_quick_alt_tab_sequence(self):
         events = []
@@ -39,6 +81,10 @@ class WindowFocusTests(unittest.TestCase):
             afk_conan,
             "SWITCH_TO_PREVIOUS_WINDOW_METHOD",
             "alt_tab",
+        ), patch.object(
+            afk_conan.key,
+            "press",
+            side_effect=lambda key_name: events.append(("press", key_name)),
         ), patch.object(
             afk_conan.key,
             "keyDown",
@@ -57,6 +103,7 @@ class WindowFocusTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                ("press", "shift"),
                 ("down", "alt"),
                 ("down", "tab"),
                 ("up", "tab"),
@@ -64,6 +111,18 @@ class WindowFocusTests(unittest.TestCase):
                 ("up", "alt"),
             ],
         )
+
+    def test_alt_tab_switching_disables_repeating_shift_presses(self):
+        with patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_ENABLED",
+            True,
+        ), patch.object(
+            afk_conan,
+            "SWITCH_TO_PREVIOUS_WINDOW_METHOD",
+            "alt_tab",
+        ):
+            self.assertFalse(afk_conan.automatic_shift_press_enabled())
 
     def test_switch_to_previous_window_can_be_disabled(self):
         with patch.object(
@@ -808,7 +867,12 @@ class ConanTelegramCommandTests(unittest.TestCase):
             }
         }
 
-    def command(self, text, alarm_window_controller=None):
+    def command(
+        self,
+        text,
+        alarm_window_controller=None,
+        talesrunner_launcher_controller=None,
+    ):
         self.update["message"]["text"] = text
         with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "12345"}, clear=False):
             return afk_conan.handle_telegram_command(
@@ -817,13 +881,75 @@ class ConanTelegramCommandTests(unittest.TestCase):
                 self.pause_event,
                 self.stop_event,
                 alarm_window_controller=alarm_window_controller,
+                talesrunner_launcher_controller=talesrunner_launcher_controller,
             )
 
     def test_help_lists_stats_without_removed_commands(self):
         help_message = self.command("/conanHelp")
         self.assertIn("/conanStats", help_message)
+        self.assertIn("/trLaunch 1|2", help_message)
         self.assertNotIn("/conanStatus", help_message)
         self.assertNotIn("/conanPing", help_message)
+
+    def test_talesrunner_launch_command_starts_selected_profile(self):
+        controller = MagicMock()
+        controller.start.return_value = True
+
+        reply = self.command(
+            "/trLaunch 2",
+            talesrunner_launcher_controller=controller,
+        )
+
+        self.assertEqual(
+            reply,
+            "TalesRunner launcher automation started for profile 2. "
+            "Its PowerShell terminal will remain open for logs.",
+        )
+        controller.start.assert_called_once_with("2")
+
+    def test_talesrunner_launch_command_requires_profile_one_or_two(self):
+        controller = MagicMock()
+
+        self.assertEqual(
+            self.command(
+                "/trLaunch",
+                talesrunner_launcher_controller=controller,
+            ),
+            "Usage: /trLaunch 1|2",
+        )
+        self.assertEqual(
+            self.command(
+                "/trLaunch 3",
+                talesrunner_launcher_controller=controller,
+            ),
+            "Usage: /trLaunch 1|2",
+        )
+        controller.start.assert_not_called()
+
+    def test_talesrunner_launcher_controller_opens_retained_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher_dir = Path(directory)
+            python_path = launcher_dir / ".venv" / "Scripts" / "python.exe"
+            script_path = launcher_dir / "talesrunner_launcher_auto.py"
+            python_path.parent.mkdir(parents=True)
+            python_path.touch()
+            script_path.touch()
+            controller = afk_conan.TalesRunnerLauncherController(
+                launcher_dir=launcher_dir,
+                powershell_path=Path("powershell.exe"),
+            )
+
+            with patch.object(afk_conan.subprocess, "Popen") as popen:
+                controller.start("1")
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "powershell.exe")
+        self.assertIn("-NoExit", command)
+        self.assertIn(str(python_path), command[-1])
+        self.assertIn(str(script_path), command[-1])
+        self.assertIn("--profile", command[-1])
+        self.assertIn("'1'", command[-1])
+        self.assertEqual(popen.call_args.kwargs["cwd"], str(launcher_dir))
 
     def test_alarm_window_start_command_parses_interval_time_and_message(self):
         controller = MagicMock()

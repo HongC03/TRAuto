@@ -148,6 +148,25 @@ def stateYZM(find, region=None):
     print("")
 
 
+def acceptFriendRequest(region=None):
+    """Accept a visible friend request, or return None when none is visible."""
+    friend_request_pos = locate_on_screen(
+        asset("friend_request.png"),
+        confidence=0.89,
+        region=region,
+    )
+    if friend_request_pos is None:
+        return None
+
+    if not triggerIfDetected(
+        asset("accept_button.png"), action="click", region=region
+    ):
+        return False
+
+    print('* 已發現並按下好友邀請的“接受”鍵 *')
+    return True
+
+
 def clearPrompt(region=None):
     """Clear prompts and return whether any blocker was handled."""
     handled = False
@@ -159,6 +178,10 @@ def clearPrompt(region=None):
     if verification_pos is not None:
         stateYZM(verification_pos, region=region)
         handled = True
+
+    friend_request_accepted = acceptFriendRequest(region=region)
+    if friend_request_accepted is not None:
+        return handled or friend_request_accepted
 
     if itemExpired(region=region):
         handled = True

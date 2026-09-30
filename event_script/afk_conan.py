@@ -21,6 +21,7 @@ import time
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
+from pathlib import Path
 from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -48,10 +49,12 @@ from utils import (
 
 # Paths and output.
 FARM_SCREEN_RECORDING_OUTPUT_DIR = BASE_DIR / "farm_screen_recordings"
-STARTUP_SCREENSHOT_OUTPUT_DIR = BASE_DIR / "startup_screenshots"
 FARM_CLICK_POSITIONS_PATH = BASE_DIR / "farm_click_positions.json"  # Saved Shift clicks.
 ALARM_WINDOW_SCRIPT_PATH = BASE_DIR / "event_script" / "alarm_window.py"  # Alarm CLI.
 CONAN_STATS_PATH = BASE_DIR / "conan_stats.json"  # Persistent Conan statistics file.
+DEFAULT_TALESRUNNER_LAUNCHER_AUTO_DIR = (
+    BASE_DIR.parent / "ai-agent-workspace" / "TalesRunner-launcher-auto"
+)
 
 # Conan detection and actions.
 TARGET_IMAGE_NAME = "conan.png"  # Template for starting a Conan task.
@@ -62,16 +65,44 @@ MATCH_END_IMAGE_NAME = "conan_end.png"  # Template marking a finished Conan task
 EXPIRED_IMAGE_NAME = "expired.png"  # Template marking an expired item prompt.
 
 # Main-loop timing and window behavior.
+def environment_positive_float(name, default):
+    """Read a positive float setting supplied by a run configuration."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive number") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
+def environment_boolean(name, default):
+    """Read a boolean setting supplied by a run configuration."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    value = raw_value.strip().casefold()
+    if value in {"1", "true", "True", "yes", "on"}:
+        return True
+    if value in {"0", "false", "False", "no", "off"}:
+        return False
+    raise ValueError("configuration not found")
+
+
 MATCH_END_WAIT_SECONDS = 20  # Grace period after Conan ends before farm starts.
-LOOP_INTERVAL = 3  # Seconds between general Conan-loop checks.
-SWITCH_TO_PREVIOUS_WINDOW_ENABLED = False  # Use Alt+Tab after each loop.
+LOOP_INTERVAL = environment_positive_float("CONAN_LOOP_INTERVAL", 3)
+SWITCH_TO_PREVIOUS_WINDOW_ENABLED = environment_boolean(
+    "CONAN_SWITCH_TO_PREVIOUS_WINDOW_ENABLED", False
+)
 SWITCH_TO_PREVIOUS_WINDOW_METHOD = "alt_tab"  # "alt_tab" Or "previous_window".
 SHIFT_RANDOM_INTERVAL = 3  # Optional +/- jitter in automatic Conan Shift presses.
 
 # Feature flags and diagnostics.
 FARM_WORKFLOW_ENABLED = True  # Enable scheduled farm runs during Conan automation.
 FARM_SCREEN_RECORDING_ENABLED = False  # Record farm runs as MP4 when enabled.
-STARTUP_SCREENSHOT_ENABLED = True  # Save one primary-monitor PNG when Conan starts.
 
 # Screen-recording settings.
 FARM_SCREEN_RECORDING_FPS = 10.0  # Automatic farm-video frame rate.
@@ -188,6 +219,7 @@ def switch_to_previous_window(previous_window=None):
             "or 'previous_window'"
         )
 
+    key.press("shift")
     key.keyDown("alt")
     try:
         key.keyDown("tab")
@@ -196,6 +228,14 @@ def switch_to_previous_window(previous_window=None):
     finally:
         key.keyUp("alt")
     return True
+
+
+def automatic_shift_press_enabled():
+    """Return whether the repeating Shift behavior should run."""
+    return not (
+        SWITCH_TO_PREVIOUS_WINDOW_ENABLED
+        and SWITCH_TO_PREVIOUS_WINDOW_METHOD == "alt_tab"
+    )
 
 
 def load_dotenv_file():
@@ -233,6 +273,71 @@ class ConanCommand(str, Enum):
     RESUME = "/conanResume"
     STOP = "/conanStop"
     ALARM_WINDOW = "/alarmWindow"
+    TR_LAUNCH = "/trLaunch"
+
+
+def powershell_quote(value):
+    """Quote one literal value for a PowerShell command string."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+class TalesRunnerLauncherController:
+    """Start the standalone launcher automation in a retained terminal."""
+
+    def __init__(self, launcher_dir=None, powershell_path=None):
+        configured_dir = os.environ.get("TALESRUNNER_LAUNCHER_AUTO_DIR")
+        self.launcher_dir = Path(
+            launcher_dir or configured_dir or DEFAULT_TALESRUNNER_LAUNCHER_AUTO_DIR
+        ).expanduser()
+        self.python_path = self.launcher_dir / ".venv" / "Scripts" / "python.exe"
+        self.script_path = self.launcher_dir / "talesrunner_launcher_auto.py"
+        self.powershell_path = Path(
+            powershell_path
+            or (
+                Path(os.environ.get("SystemRoot", r"C:\Windows"))
+                / "System32"
+                / "WindowsPowerShell"
+                / "v1.0"
+                / "powershell.exe"
+            )
+        )
+
+    def start(self, profile_number):
+        """Start profile 1 or 2 without blocking Telegram command polling."""
+        if profile_number not in {"1", "2"}:
+            raise ValueError("profile must be 1 or 2")
+        if not self.python_path.is_file():
+            raise FileNotFoundError(
+                f"Launcher Python environment not found: {self.python_path}"
+            )
+        if not self.script_path.is_file():
+            raise FileNotFoundError(
+                f"Launcher automation not found: {self.script_path}"
+            )
+
+        launcher_command = " ".join(
+            (
+                f"& {powershell_quote(self.python_path)}",
+                powershell_quote(self.script_path),
+                "--profile",
+                powershell_quote(profile_number),
+            )
+        )
+        command = [
+            str(self.powershell_path),
+            "-NoLogo",
+            "-NoExit",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            launcher_command,
+        ]
+        subprocess.Popen(
+            command,
+            cwd=str(self.launcher_dir),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+        return True
 
 
 class AlarmWindowController:
@@ -560,6 +665,7 @@ def telegram_help_message():
         f"{ConanCommand.PAUSE.value} - pause the automation loop\n"
         f"{ConanCommand.RESUME.value} - resume the automation loop\n"
         f"{ConanCommand.STOP.value} - stop the automation\n"
+        f"{ConanCommand.TR_LAUNCH.value} 1|2 - launch and log in to TalesRunner\n"
         f"{ConanCommand.ALARM_WINDOW.value} [interval] [HH:MM] [message] - start alarm window\n"
         f"{ConanCommand.ALARM_WINDOW.value} status - show alarm window status\n"
         f"{ConanCommand.ALARM_WINDOW.value} stop - stop alarm window"
@@ -762,7 +868,12 @@ def parse_alarm_window_arguments(arguments):
 
 
 def handle_telegram_command(
-    update, status, pause_event, stop_event, alarm_window_controller=None
+    update,
+    status,
+    pause_event,
+    stop_event,
+    alarm_window_controller=None,
+    talesrunner_launcher_controller=None,
 ):
     """Handle one authorized command and return a text reply, if applicable."""
     command_info = telegram_command_for_update(update)
@@ -788,6 +899,21 @@ def handle_telegram_command(
         if alarm_window_controller is not None:
             alarm_window_controller.stop()
         return "Stopping Conan automation."
+    if command is ConanCommand.TR_LAUNCH:
+        if len(arguments) != 1 or arguments[0] not in {"1", "2"}:
+            return "Usage: /trLaunch 1|2"
+        try:
+            controller = (
+                talesrunner_launcher_controller
+                or TalesRunnerLauncherController()
+            )
+            controller.start(arguments[0])
+            return (
+                "TalesRunner launcher automation started for profile "
+                f"{arguments[0]}. Its PowerShell terminal will remain open for logs."
+            )
+        except (FileNotFoundError, OSError, ValueError) as error:
+            return f"Unable to start TalesRunner launcher: {error}"
     if command is ConanCommand.ALARM_WINDOW:
         try:
             options = parse_alarm_window_arguments(arguments)
@@ -870,7 +996,7 @@ def initialize_telegram_offset(persistent_stats):
 
 def poll_telegram_commands(
     status, pause_event, stop_event, persistent_stats=None,
-    alarm_window_controller=None,
+    alarm_window_controller=None, talesrunner_launcher_controller=None,
 ):
     """Listen for authorized Telegram commands until the process stops."""
     offset = (
@@ -913,6 +1039,7 @@ def poll_telegram_commands(
                     pause_event,
                     stop_event,
                     alarm_window_controller=alarm_window_controller,
+                    talesrunner_launcher_controller=talesrunner_launcher_controller,
                 )
                 if reply is not None:
                     send_telegram_message(reply, chat_id=chat_id)
@@ -1218,6 +1345,8 @@ def load_farm_click_positions():
     positions = []
     for item in raw_positions:
         if isinstance(item, dict):
+            if item.get("enabled", True) is False:
+                continue
             x, y = item.get("x"), item.get("y")
         elif isinstance(item, (list, tuple)) and len(item) == 2:
             x, y = item
@@ -1395,26 +1524,6 @@ def stop_farm_screen_recording(recorder):
         print(f"* 農場錄影儲存失敗: {error} *")
         return None
     print(f"* 農場錄影已儲存: {output_path} *")
-    return output_path
-
-
-def save_startup_screenshot():
-    """Save one primary-monitor screenshot at startup when enabled."""
-    if not STARTUP_SCREENSHOT_ENABLED:
-        return None
-    try:
-        screenshot = gui.screenshot()
-        STARTUP_SCREENSHOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        output_path = (
-            STARTUP_SCREENSHOT_OUTPUT_DIR
-            / f"conan_startup_{timestamp}.png"
-        )
-        screenshot.save(output_path)
-    except Exception as error:
-        print(f"* 啟動截圖儲存失敗，繼續執行 Conan: {error} *")
-        return None
-    print(f"* Conan 啟動截圖已儲存: {output_path} *")
     return output_path
 
 
@@ -1616,7 +1725,6 @@ def parse_args(argv=None):
 
 def main(test_farm_workflow=False, record_farm_video=None):
     load_dotenv_file()
-    save_startup_screenshot()
     if record_farm_video is None:
         record_farm_video = FARM_SCREEN_RECORDING_ENABLED
     farm_required = FARM_WORKFLOW_ENABLED or test_farm_workflow
@@ -1647,6 +1755,7 @@ def main(test_farm_workflow=False, record_farm_video=None):
     shift_press_thread = None
     telegram_thread = None
     alarm_window_controller = AlarmWindowController()
+    talesrunner_launcher_controller = TalesRunnerLauncherController()
     next_scheduled_image_at, farm_workflow_pending = (
         initialize_persistent_farm_schedule(persistent_stats)
     )
@@ -1665,7 +1774,10 @@ def main(test_farm_workflow=False, record_farm_video=None):
         telegram_thread = threading.Thread(
             target=poll_telegram_commands,
             args=(status, pause_event, stop_event, persistent_stats),
-            kwargs={"alarm_window_controller": alarm_window_controller},
+            kwargs={
+                "alarm_window_controller": alarm_window_controller,
+                "talesrunner_launcher_controller": talesrunner_launcher_controller,
+            },
             name="telegram-commands",
             daemon=True,
         )
@@ -1725,7 +1837,9 @@ def main(test_farm_workflow=False, record_farm_video=None):
                     pending=farm_workflow_pending,
                 )
 
-                if shift_press_thread is None or not shift_press_thread.is_alive():
+                if automatic_shift_press_enabled() and (
+                    shift_press_thread is None or not shift_press_thread.is_alive()
+                ):
                     shift_stop_event.clear()
                     shift_press_thread = threading.Thread(
                         target=autoPressButton,
