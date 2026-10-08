@@ -18,7 +18,8 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -41,10 +42,13 @@ from game_supervisor import (
 )
 from utils import (
     autoPressButton,
+    capture_screen,
     locate_on_screen,
     pressButton,
     triggerIfDetected,
+    use_screen_capture,
 )
+from screen_capture import GameScreenCapture, ScreenCaptureUnavailable
 
 
 # Paths and output.
@@ -89,7 +93,7 @@ def environment_boolean(name, default):
         return True
     if value in {"0", "false", "False", "no", "off"}:
         return False
-    raise ValueError("configuration not found")
+    raise ValueError(f"{name} must be true, false, yes, no, on, off, 1, or 0")
 
 
 MATCH_END_WAIT_SECONDS = 20  # Grace period after Conan ends before farm starts.
@@ -165,7 +169,10 @@ FARM_STEP_RETRIES = 2  # Total attempts for every actionable farm step.
 
 # Telegram and alarm settings.
 TELEGRAM_POLL_TIMEOUT = 5  # Telegram long-poll timeout in seconds.
-TELEGRAM_RETRY_DELAY = 5  # Delay before retrying failed Telegram polling.
+TELEGRAM_RETRY_DELAY = 5  # Initial delay before retrying Telegram polling.
+TELEGRAM_MAX_RETRY_DELAY = 60  # Cap repeated connection-failure backoff.
+INACTIVITY_WARNING_SECONDS = 15 * 60  # Warn when completed activities stop.
+ACTIVITY_MONITOR_INTERVAL_SECONDS = 1  # Independent of the game/image loop.
 ALARM_WINDOW_DEFAULT_INTERVAL_SECONDS = 60  # Default recurring desktop alarm period.
 ALARM_WINDOW_DEFAULT_TITLE = ""  # Default title for Telegram-started alarm windows.
 ALARM_WINDOW_DEFAULT_MESSAGE = "The alarm interval has elapsed."  # Alarm text.
@@ -426,6 +433,7 @@ class ConanStage(str, Enum):
     WAITING_AFTER_MATCH_FINISHED = "waiting after match finished"
     PAUSED_BY_COMMAND = "paused by Telegram command"
     GAME_PAUSED = "game paused"
+    SCREEN_UNAVAILABLE = "waiting for screen capture"
 
 
 class PersistentConanStats:
@@ -544,7 +552,7 @@ class PersistentConanStats:
 class ConanStatus:
     """Thread-safe progress state shared by the game loop and Telegram worker."""
 
-    def __init__(self, persistent_stats=None):
+    def __init__(self, persistent_stats=None, telegram_notifications_enabled=False):
         self._lock = threading.Lock()
         self.persistent_stats = persistent_stats
         self.matches_finished = 0
@@ -555,6 +563,89 @@ class ConanStatus:
         self.restarts = 0
         self.next_farm_at = None
         self.farm_workflow_pending = False
+        self.telegram_notifications_enabled = telegram_notifications_enabled
+        self._notifications = deque()
+        self._last_progress_description = "script startup"
+        self._watchdog_reference_at = self.started_at
+        self._watchdog_paused = False
+        self._stuck_alerted = False
+        self._farm_started_at = None
+
+    def _queue_activity_locked(self, message, progress=False):
+        """Record progress and enqueue logs without making network calls."""
+        timestamp = datetime.now(timezone(timedelta(hours=8))).strftime(
+            "%Y-%m-%d %H:%M:%S HKT"
+        )
+        if self.telegram_notifications_enabled:
+            self._notifications.append(f"[{timestamp}] {message}")
+        if progress:
+            now = time.monotonic()
+            self._watchdog_reference_at = now
+            self._last_progress_description = f"{message} at {timestamp}"
+            if self._stuck_alerted and self.telegram_notifications_enabled:
+                self._notifications.append(
+                    f"[{timestamp}] Conan activity resumed after the inactivity warning."
+                )
+            self._stuck_alerted = False
+
+    def record_farm_started(self):
+        with self._lock:
+            self._farm_started_at = time.monotonic()
+            self._queue_activity_locked("Farm workflow started.")
+
+    def record_farm_finished(self, outcome):
+        with self._lock:
+            duration = (
+                0 if self._farm_started_at is None
+                else max(0, time.monotonic() - self._farm_started_at)
+            )
+            self._farm_started_at = None
+            self._queue_activity_locked(
+                f"Farm workflow {outcome} (duration: {format_duration(duration)}).",
+                progress=outcome == "completed",
+            )
+
+    def _set_watchdog_paused_locked(self, paused, now):
+        if self._watchdog_paused and not paused:
+            # A deliberate pause gets a fresh 15-minute window on resume.
+            self._watchdog_reference_at = now
+            self._stuck_alerted = False
+        self._watchdog_paused = paused
+
+    def set_watchdog_paused(self, paused):
+        with self._lock:
+            self._set_watchdog_paused_locked(paused, time.monotonic())
+
+    def check_inactivity(self, paused=False):
+        """Queue one warning per idle period, even if the game loop is blocked."""
+        with self._lock:
+            now = time.monotonic()
+            self._set_watchdog_paused_locked(paused, now)
+            if paused or not self.telegram_notifications_enabled or self._stuck_alerted:
+                return
+            idle_seconds = now - self._watchdog_reference_at
+            if idle_seconds < INACTIVITY_WARNING_SECONDS:
+                return
+            self._stuck_alerted = True
+            self._queue_activity_locked(
+                "Possible stuck Conan automation: no match end or successful farm "
+                f"completion for {format_duration(idle_seconds)}.\n"
+                f"Current stage: {self.current_stage.value}"
+                + (f" ({self.game_state})" if self.game_state else "")
+                + f"\nLast completed activity: {self._last_progress_description}"
+            )
+
+    def send_pending_notifications(self, limit=5):
+        """Deliver from the worker; retain the first failed message for retry."""
+        for _ in range(limit):
+            with self._lock:
+                if not self._notifications:
+                    return
+                message = self._notifications[0]
+            if not send_telegram_message(message):
+                return
+            with self._lock:
+                self._notifications.popleft()
 
     def set_stage(self, stage):
         if not isinstance(stage, ConanStage):
@@ -575,6 +666,10 @@ class ConanStatus:
             self.current_stage = ConanStage.MATCH_FINISHED
             self.game_state = None
             self.last_match_at = timestamp
+            self._queue_activity_locked(
+                f"Conan match ended. Session matches finished: {self.matches_finished}.",
+                progress=True,
+            )
         if self.persistent_stats is not None:
             self.persistent_stats.record_match_finished(timestamp)
 
@@ -601,6 +696,8 @@ class ConanStatus:
                 "restarts": self.restarts,
                 "next_farm_at": self.next_farm_at,
                 "farm_workflow_pending": self.farm_workflow_pending,
+                "last_completed_activity": self._last_progress_description,
+                "inactivity_warning": self._stuck_alerted,
             }
         snapshot["next_farm_seconds"] = (
             None
@@ -649,6 +746,7 @@ def format_stats_message(status):
         f"Next farm remaining: {next_farm}\n"
         f"Uptime: {format_duration(snapshot['uptime_seconds'])}\n"
         f"Last match: {last_match}\n"
+        f"Last completed activity: {snapshot['last_completed_activity']}\n"
         f"Session restarts: {snapshot['restarts']}\n"
         f"Total matches: {snapshot['persistent']['total_matches_finished']}\n"
         f"Total runs: {snapshot['persistent']['total_runs']}\n"
@@ -732,7 +830,7 @@ def send_telegram_screenshot(chat_id=None):
         return False
 
     try:
-        screenshot = gui.screenshot()
+        screenshot = capture_screen()
         image_buffer = BytesIO()
         screenshot.save(image_buffer, format="PNG")
         image_data = image_buffer.getvalue()
@@ -887,10 +985,12 @@ def handle_telegram_command(
         return format_stats_message(status)
     if command is ConanCommand.PAUSE:
         pause_event.set()
+        status.set_watchdog_paused(True)
         status.set_stage(ConanStage.PAUSED_BY_COMMAND)
         return "Conan automation paused."
     if command is ConanCommand.RESUME:
         pause_event.clear()
+        status.set_watchdog_paused(False)
         status.set_stage(ConanStage.CHECKING_GAME_STATE)
         return "Conan automation resumed."
     if command is ConanCommand.STOP:
@@ -994,6 +1094,17 @@ def initialize_telegram_offset(persistent_stats):
         )
 
 
+def monitor_conan_activity(status, pause_event, shutdown_event):
+    """Send activity logs and watch for stalls independently of game polling."""
+    while not shutdown_event.is_set():
+        status.check_inactivity(paused=pause_event.is_set())
+        status.send_pending_notifications()
+        if shutdown_event.wait(ACTIVITY_MONITOR_INTERVAL_SECONDS):
+            break
+    # Farm cancellation/completion can be queued as the main loop shuts down.
+    status.send_pending_notifications()
+
+
 def poll_telegram_commands(
     status, pause_event, stop_event, persistent_stats=None,
     alarm_window_controller=None, talesrunner_launcher_controller=None,
@@ -1004,6 +1115,8 @@ def poll_telegram_commands(
         if persistent_stats is not None
         else None
     )
+    retry_delay = TELEGRAM_RETRY_DELAY
+    polling_interrupted = False
     while not stop_event.is_set():
         payload = {"timeout": TELEGRAM_POLL_TIMEOUT}
         if offset is not None:
@@ -1011,6 +1124,10 @@ def poll_telegram_commands(
 
         try:
             result = telegram_api_request("getUpdates", payload)
+            if polling_interrupted:
+                print("* Telegram command polling recovered *")
+                polling_interrupted = False
+            retry_delay = TELEGRAM_RETRY_DELAY
             for update in result.get("result", []):
                 update_id = update.get("update_id")
                 if update_id is not None:
@@ -1047,12 +1164,15 @@ def poll_telegram_commands(
             if stop_event.is_set():
                 acknowledge_telegram_updates(offset)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError) as error:
+            polling_interrupted = True
             print(
-                f"Telegram command polling failed: {_telegram_error_reason(error)}",
+                "Telegram command polling failed; "
+                f"retrying in {retry_delay} seconds: {_telegram_error_reason(error)}",
                 file=sys.stderr,
             )
-            if stop_event.wait(TELEGRAM_RETRY_DELAY):
+            if stop_event.wait(retry_delay):
                 break
+            retry_delay = min(retry_delay * 2, TELEGRAM_MAX_RETRY_DELAY)
 
 
 def target_image_path():
@@ -1091,6 +1211,8 @@ def clear_expired_prompt():
 
     try:
         expired_position = locate_on_primary_screen(image_path)
+    except ScreenCaptureUnavailable:
+        raise
     except (OSError, TypeError, ValueError):
         return True
     if expired_position is None:
@@ -1102,6 +1224,8 @@ def clear_expired_prompt():
             continue
         try:
             cross_position = locate_on_primary_screen(cross_path)
+        except ScreenCaptureUnavailable:
+            raise
         except (OSError, TypeError, ValueError):
             continue
         if cross_position is not None:
@@ -1273,6 +1397,8 @@ def is_farm_image_visible(image_name):
         return False
     try:
         visible = locate_on_primary_screen(image_path) is not None
+    except ScreenCaptureUnavailable:
+        raise
     except (OSError, TypeError, ValueError):
         return False
     if visible:
@@ -1536,11 +1662,13 @@ def run_farm_workflow(
     """Run the farm flow and recover to Conan after a timed-out step."""
     if status is not None:
         status.set_stage(ConanStage.FARM_WORKFLOW)
+        status.record_farm_started()
     if record_video is None:
         record_video = FARM_SCREEN_RECORDING_ENABLED
     print("* 開始農場流程 *")
-    recorder = start_farm_screen_recording() if record_video else None
+    recorder = None
     try:
+        recorder = start_farm_screen_recording() if record_video else None
         workflow = create_farm_workflow(
             stop_event=stop_event,
             pause_event=pause_event,
@@ -1557,7 +1685,23 @@ def run_farm_workflow(
                 print("* 開始返回 Conan 流程 *")
                 workflow.run_return_sequence()
         print("* 農場流程完成 *" if completed else "* 農場流程失敗 *")
+        if status is not None:
+            cancelled = (
+                (stop_event is not None and stop_event.is_set())
+                or (pause_event is not None and pause_event.is_set())
+            )
+            status.record_farm_finished(
+                "completed" if completed else "cancelled" if cancelled else "failed"
+            )
         return completed
+    except Exception as error:
+        if status is not None:
+            status.record_farm_finished(f"interrupted ({type(error).__name__})")
+        raise
+    except KeyboardInterrupt:
+        if status is not None:
+            status.record_farm_finished("cancelled")
+        raise
     finally:
         stop_farm_screen_recording(recorder)
 
@@ -1647,6 +1791,8 @@ def is_match_end_visible():
         return False
     try:
         return locate_on_primary_screen(image_path) is not None
+    except ScreenCaptureUnavailable:
+        raise
     except (OSError, TypeError, ValueError):
         return False
 
@@ -1724,6 +1870,11 @@ def parse_args(argv=None):
 
 
 def main(test_farm_workflow=False, record_farm_video=None):
+    with use_screen_capture(GameScreenCapture(get_tales_runner_window)):
+        return _main(test_farm_workflow, record_farm_video)
+
+
+def _main(test_farm_workflow=False, record_farm_video=None):
     load_dotenv_file()
     if record_farm_video is None:
         record_farm_video = FARM_SCREEN_RECORDING_ENABLED
@@ -1748,12 +1899,17 @@ def main(test_farm_workflow=False, record_farm_video=None):
     )
     persistent_stats = PersistentConanStats(CONAN_STATS_PATH)
     persistent_stats.record_run_started()
-    status = ConanStatus(persistent_stats)
+    telegram_enabled = telegram_is_configured()
+    status = ConanStatus(
+        persistent_stats, telegram_notifications_enabled=telegram_enabled
+    )
     shift_stop_event = threading.Event()
     pause_event = threading.Event()
     stop_event = threading.Event()
     shift_press_thread = None
     telegram_thread = None
+    activity_thread = None
+    activity_shutdown_event = None
     alarm_window_controller = AlarmWindowController()
     talesrunner_launcher_controller = TalesRunnerLauncherController()
     next_scheduled_image_at, farm_workflow_pending = (
@@ -1765,11 +1921,12 @@ def main(test_farm_workflow=False, record_farm_video=None):
         pending=farm_workflow_pending,
     )
     conan_end_image_visible = False
+    screen_unavailable = False
 
     if not FARM_WORKFLOW_ENABLED:
         print("* 農場流程已停用；Conan 任務將繼續執行 *")
 
-    if telegram_is_configured():
+    if telegram_enabled:
         initialize_telegram_offset(persistent_stats)
         telegram_thread = threading.Thread(
             target=poll_telegram_commands,
@@ -1782,133 +1939,157 @@ def main(test_farm_workflow=False, record_farm_video=None):
             daemon=True,
         )
         telegram_thread.start()
+        activity_shutdown_event = threading.Event()
+        activity_thread = threading.Thread(
+            target=monitor_conan_activity,
+            args=(status, pause_event, activity_shutdown_event),
+            name="conan-activity-monitor",
+            daemon=True,
+        )
+        activity_thread.start()
         print("* Telegram Conan command monitor started *")
     else:
         print("* Telegram commands disabled: credentials are not configured *")
 
     try:
         while not stop_event.is_set():
-            previous_window = (
-                get_active_window()
-                if SWITCH_TO_PREVIOUS_WINDOW_METHOD == "previous_window"
-                else None
-            )
-            if not clear_expired_prompt():
-                stop_event.wait(LOOP_INTERVAL)
-                continue
-            if pause_event.is_set():
-                shift_stop_event.set()
-                status.set_stage(ConanStage.PAUSED_BY_COMMAND)
-                stop_event.wait(LOOP_INTERVAL)
-                continue
-
-            status.set_stage(ConanStage.CHECKING_GAME_STATE)
-            game_state = supervisor.ensure_ready()
-            if startup_farm_pending and game_state in ("ready", "started"):
-                shift_stop_event.set()
-                status.set_stage(ConanStage.FARM_WORKFLOW)
-                run_farm_workflow(
-                    status=status,
-                    stop_event=stop_event,
-                    pause_event=pause_event,
-                    record_video=record_farm_video,
-                )
-                if stop_event.is_set():
-                    continue
-                next_scheduled_image_at = schedule_next_farm_run(
-                    persistent_stats
-                )
-                farm_workflow_pending = False
-                startup_farm_pending = False
-                status.set_farm_schedule(
-                    next_scheduled_image_at,
-                    pending=False,
-                )
-                continue
-
-            if game_state == "ready":
-                status.set_stage(ConanStage.CHECKING_SCHEDULED_IMAGE)
-                farm_workflow_pending = mark_farm_workflow_pending_if_enabled(
-                    next_scheduled_image_at,
-                    pending=farm_workflow_pending,
-                )
-                status.set_farm_schedule(
-                    next_scheduled_image_at if FARM_WORKFLOW_ENABLED else None,
-                    pending=farm_workflow_pending,
-                )
-
-                if automatic_shift_press_enabled() and (
-                    shift_press_thread is None or not shift_press_thread.is_alive()
-                ):
-                    shift_stop_event.clear()
-                    shift_press_thread = threading.Thread(
-                        target=autoPressButton,
-                        kwargs={
-                            "button": "shift",
-                            "press_interval": 10,
-                            "random_interval": SHIFT_RANDOM_INTERVAL,
-                            "stop_condition": shift_stop_event.is_set,
-                        },
-                        daemon=True,
-                    )
-                    shift_press_thread.start()
-                status.set_stage(ConanStage.WAITING_FOR_MATCH)
-                run_task_step()
-                (
-                    conan_end_image_visible,
-                    conan_match_finished,
-                ) = detect_match_finished(
-                    status,
-                    previously_visible=conan_end_image_visible,
-                )
-
-                if farm_workflow_pending and not conan_match_finished:
-                    status.set_stage(ConanStage.FARM_WORKFLOW_PENDING)
-
-                if farm_workflow_pending and conan_match_finished:
+            try:
+                if pause_event.is_set():
                     shift_stop_event.set()
-                    if shift_press_thread is not None and shift_press_thread.is_alive():
-                        shift_press_thread.join(timeout=12)
-                    status.set_stage(ConanStage.WAITING_AFTER_MATCH_FINISHED)
-                    if wait_after_match_finished(
+                    status.set_stage(ConanStage.PAUSED_BY_COMMAND)
+                    stop_event.wait(LOOP_INTERVAL)
+                    continue
+                previous_window = (
+                    get_active_window()
+                    if SWITCH_TO_PREVIOUS_WINDOW_METHOD == "previous_window"
+                    else None
+                )
+                if not clear_expired_prompt():
+                    stop_event.wait(LOOP_INTERVAL)
+                    continue
+                status.set_stage(ConanStage.CHECKING_GAME_STATE)
+                game_state = supervisor.ensure_ready()
+                if startup_farm_pending and game_state in ("ready", "started"):
+                    shift_stop_event.set()
+                    status.set_stage(ConanStage.FARM_WORKFLOW)
+                    run_farm_workflow(
+                        status=status,
                         stop_event=stop_event,
                         pause_event=pause_event,
+                        record_video=record_farm_video,
+                    )
+                    if stop_event.is_set():
+                        continue
+                    next_scheduled_image_at = schedule_next_farm_run(
+                        persistent_stats
+                    )
+                    farm_workflow_pending = False
+                    startup_farm_pending = False
+                    status.set_farm_schedule(
+                        next_scheduled_image_at,
+                        pending=False,
+                    )
+                    continue
+
+                if game_state == "ready":
+                    status.set_stage(ConanStage.CHECKING_SCHEDULED_IMAGE)
+                    farm_workflow_pending = mark_farm_workflow_pending_if_enabled(
+                        next_scheduled_image_at,
+                        pending=farm_workflow_pending,
+                    )
+                    status.set_farm_schedule(
+                        next_scheduled_image_at if FARM_WORKFLOW_ENABLED else None,
+                        pending=farm_workflow_pending,
+                    )
+
+                    if automatic_shift_press_enabled() and (
+                        shift_press_thread is None or not shift_press_thread.is_alive()
                     ):
-                        (
-                            next_scheduled_image_at,
-                            farm_workflow_pending,
-                        ) = run_pending_farm_workflow_if_match_finished(
-                            next_scheduled_image_at,
-                            farm_workflow_pending,
-                            conan_match_finished,
-                            status=status,
+                        shift_stop_event.clear()
+                        shift_press_thread = threading.Thread(
+                            target=autoPressButton,
+                            kwargs={
+                                "button": "shift",
+                                "press_interval": 10,
+                                "random_interval": SHIFT_RANDOM_INTERVAL,
+                                "stop_condition": shift_stop_event.is_set,
+                            },
+                            daemon=True,
+                        )
+                        shift_press_thread.start()
+                    status.set_stage(ConanStage.WAITING_FOR_MATCH)
+                    run_task_step()
+                    (
+                        conan_end_image_visible,
+                        conan_match_finished,
+                    ) = detect_match_finished(
+                        status,
+                        previously_visible=conan_end_image_visible,
+                    )
+
+                    if farm_workflow_pending and not conan_match_finished:
+                        status.set_stage(ConanStage.FARM_WORKFLOW_PENDING)
+
+                    if farm_workflow_pending and conan_match_finished:
+                        shift_stop_event.set()
+                        if shift_press_thread is not None and shift_press_thread.is_alive():
+                            shift_press_thread.join(timeout=12)
+                        status.set_stage(ConanStage.WAITING_AFTER_MATCH_FINISHED)
+                        if wait_after_match_finished(
                             stop_event=stop_event,
                             pause_event=pause_event,
-                            record_video=record_farm_video,
-                            persistent_stats=persistent_stats,
-                        )
-                        status.set_farm_schedule(
-                            next_scheduled_image_at,
-                            pending=farm_workflow_pending,
-                        )
-            else:
-                shift_stop_event.set()
-                conan_end_image_visible = False
-                if game_state == "restarted":
-                    status.record_restart()
-                status.set_game_paused(game_state)
-                print(f"* 遊戲狀態為 {game_state}，任務已暫停 *")
+                        ):
+                            (
+                                next_scheduled_image_at,
+                                farm_workflow_pending,
+                            ) = run_pending_farm_workflow_if_match_finished(
+                                next_scheduled_image_at,
+                                farm_workflow_pending,
+                                conan_match_finished,
+                                status=status,
+                                stop_event=stop_event,
+                                pause_event=pause_event,
+                                record_video=record_farm_video,
+                                persistent_stats=persistent_stats,
+                            )
+                            status.set_farm_schedule(
+                                next_scheduled_image_at,
+                                pending=farm_workflow_pending,
+                            )
+                else:
+                    shift_stop_event.set()
+                    conan_end_image_visible = False
+                    if game_state == "restarted":
+                        status.record_restart()
+                    status.set_game_paused(game_state)
+                    print(f"* 遊戲狀態為 {game_state}，任務已暫停 *")
 
-            if SWITCH_TO_PREVIOUS_WINDOW_ENABLED and not stop_event.is_set():
-                switch_to_previous_window(previous_window)
+                if SWITCH_TO_PREVIOUS_WINDOW_ENABLED and not stop_event.is_set():
+                    switch_to_previous_window(previous_window)
+            except ScreenCaptureUnavailable as error:
+                shift_stop_event.set()
+                if status.snapshot()["current_stage"] is ConanStage.FARM_WORKFLOW:
+                    startup_farm_pending = True
+                status.set_stage(ConanStage.SCREEN_UNAVAILABLE)
+                if not screen_unavailable:
+                    print(f"* Screen capture unavailable; retrying: {error} *")
+                screen_unavailable = True
+            else:
+                if screen_unavailable:
+                    print("* Screen capture recovered; Conan automation resumed *")
+                    screen_unavailable = False
             stop_event.wait(LOOP_INTERVAL)
     finally:
         shift_stop_event.set()
         stop_event.set()
+        if activity_shutdown_event is not None:
+            activity_shutdown_event.set()
         alarm_window_controller.stop()
         persistent_stats.record_runtime(time.monotonic() - status.started_at)
         if telegram_thread is not None:
             telegram_thread.join(timeout=2)
+        if activity_thread is not None:
+            activity_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

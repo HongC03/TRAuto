@@ -2,11 +2,15 @@ import importlib
 import io
 import json
 import os
+import ssl
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
+from urllib.error import URLError
+from urllib.parse import parse_qs
 
 
 for module_name in (
@@ -25,6 +29,124 @@ if "PIL" not in sys.modules:
     sys.modules["PIL.Image"] = pil.Image
 
 afk_conan = importlib.import_module("event_script.afk_conan")
+from screen_capture import ScreenCaptureUnavailable
+
+
+class MonitorPowerRecoveryTests(unittest.TestCase):
+    def test_main_retries_screen_failure_without_stopping_telegram(self):
+        threads = []
+
+        def make_thread(*args, **kwargs):
+            thread = MagicMock()
+            thread.options = kwargs
+            threads.append(thread)
+            return thread
+
+        def recovered_task():
+            stop_event = threads[0].options["args"][2]
+            self.assertFalse(stop_event.is_set())
+            stop_event.set()
+
+        with ExitStack() as stack:
+            def mocked(name, **kwargs):
+                return stack.enter_context(patch.object(afk_conan, name, **kwargs))
+
+            mocked("load_dotenv_file")
+            mocked("validate_configuration")
+            mocked("PersistentConanStats")
+            mocked("initialize_persistent_farm_schedule", return_value=(100, False))
+            mocked("initialize_telegram_offset")
+            mocked("telegram_is_configured", return_value=True)
+            mocked("clear_expired_prompt", return_value=True)
+            mocked("FARM_WORKFLOW_ENABLED", new=False)
+            mocked("automatic_shift_press_enabled", return_value=False)
+            mocked("detect_match_finished", return_value=(False, False))
+            mocked("SWITCH_TO_PREVIOUS_WINDOW_ENABLED", new=False)
+            supervisor = stack.enter_context(
+                patch.object(afk_conan.GameSupervisor, "from_config")
+            ).return_value
+            supervisor.ensure_ready.return_value = "ready"
+            stack.enter_context(
+                patch.object(afk_conan.threading, "Thread", side_effect=make_thread)
+            )
+            stack.enter_context(patch.object(afk_conan, "LOOP_INTERVAL", 0.001))
+            task = mocked("run_task_step")
+            outcomes = iter((ScreenCaptureUnavailable("screen grab failed"), None))
+
+            def run_task():
+                outcome = next(outcomes)
+                if outcome is not None:
+                    raise outcome
+                recovered_task()
+
+            task.side_effect = run_task
+            output = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            afk_conan.main()
+
+        self.assertEqual(task.call_count, 2)
+        self.assertEqual(len(threads), 2)
+        threads[0].start.assert_called_once()
+        threads[1].start.assert_called_once()
+        self.assertIn("Screen capture unavailable", output.getvalue())
+        self.assertIn("Screen capture recovered", output.getvalue())
+
+    def test_capture_errors_are_not_treated_as_missing_templates(self):
+        for operation in (
+            afk_conan.clear_expired_prompt,
+            afk_conan.is_match_end_visible,
+            lambda: afk_conan.is_farm_image_visible("farm/crops_management_failure.png"),
+        ):
+            with self.subTest(operation=operation), patch.object(
+                afk_conan, "locate_on_primary_screen",
+                side_effect=ScreenCaptureUnavailable("screen grab failed"),
+            ), self.assertRaises(ScreenCaptureUnavailable):
+                operation()
+
+    def test_farm_capture_failure_keeps_the_due_schedule_until_retry(self):
+        stop_event = __import__("threading").Event()
+        calls = 0
+
+        def farm_attempt(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ScreenCaptureUnavailable("screen grab failed")
+            return True
+
+        def next_schedule(stats):
+            self.assertEqual(calls, 2)
+            stop_event.set()
+            return 200
+
+        with ExitStack() as stack:
+            def mocked(name, **kwargs):
+                return stack.enter_context(patch.object(afk_conan, name, **kwargs))
+
+            mocked("load_dotenv_file")
+            mocked("validate_configuration")
+            mocked("PersistentConanStats")
+            mocked("initialize_persistent_farm_schedule", return_value=(100, True))
+            mocked("telegram_is_configured", return_value=False)
+            mocked("clear_expired_prompt", return_value=True)
+            mocked("run_farm_workflow", side_effect=farm_attempt)
+            schedule = mocked("schedule_next_farm_run", side_effect=next_schedule)
+            mocked("automatic_shift_press_enabled", return_value=False)
+            mocked("SWITCH_TO_PREVIOUS_WINDOW_ENABLED", new=False)
+            supervisor = stack.enter_context(
+                patch.object(afk_conan.GameSupervisor, "from_config")
+            ).return_value
+            supervisor.ensure_ready.return_value = "ready"
+            # The first two events are for Shift and pause; the third is stop.
+            stack.enter_context(patch.object(
+                afk_conan.threading, "Event",
+                side_effect=[__import__("threading").Event(), __import__("threading").Event(), stop_event],
+            ))
+            mocked("LOOP_INTERVAL", new=0.001)
+            stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            afk_conan.main()
+
+        self.assertEqual(calls, 2)
+        schedule.assert_called_once()
 
 
 class RunConfigurationSettingsTests(unittest.TestCase):
@@ -231,6 +353,275 @@ class FakeScreenshot:
     def save(self, output, format):
         self.format = format
         output.write(b"fake-png")
+
+
+class ConanActivityNotificationTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0
+        clock_patch = patch.object(afk_conan.time, "monotonic", side_effect=lambda: self.now)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+        sender_patch = patch.object(afk_conan, "send_telegram_message", return_value=True)
+        self.send = sender_patch.start()
+        self.addCleanup(sender_patch.stop)
+        self.status = afk_conan.ConanStatus(telegram_notifications_enabled=True)
+
+    def messages(self):
+        self.status.send_pending_notifications()
+        return [item.args[0] for item in self.send.call_args_list]
+
+    def test_each_distinct_match_end_logs_once_with_hkt_timestamp(self):
+        visible = False
+        with patch.object(afk_conan, "is_match_end_visible", side_effect=[True, True, False, True]):
+            for _ in range(4):
+                visible, _ = afk_conan.detect_match_finished(self.status, visible)
+        messages = self.messages()
+        self.assertEqual(len(messages), 2)
+        self.assertIn("HKT] Conan match ended", messages[0])
+        self.assertIn("Session matches finished: 1", messages[0])
+        self.assertIn("Session matches finished: 2", messages[1])
+
+    def test_farm_logs_start_and_success_with_duration(self):
+        workflow = MagicMock()
+
+        def finish():
+            self.now = 5
+            return True
+
+        workflow.run.side_effect = finish
+        with patch.object(afk_conan, "create_farm_workflow", return_value=workflow):
+            self.assertTrue(afk_conan.run_farm_workflow(status=self.status))
+        messages = self.messages()
+        self.assertEqual(len(messages), 2)
+        self.assertIn("Farm workflow started", messages[0])
+        self.assertIn("Farm workflow completed (duration: 0h 0m 5s)", messages[1])
+        self.now = 904
+        self.status.check_inactivity()
+        self.assertEqual(len(self.messages()), 2)
+        self.now = 905
+        self.status.check_inactivity()
+        self.assertIn("Possible stuck", self.messages()[-1])
+
+    def test_failed_farm_logs_do_not_hide_fifteen_minutes_without_progress(self):
+        workflow = MagicMock()
+        workflow.run.return_value = False
+        with patch.object(afk_conan, "create_farm_workflow", return_value=workflow), patch.object(
+            afk_conan, "clear_prompts_until_unblocked", return_value=True
+        ):
+            for attempt_at in (400, 800):
+                self.now = attempt_at
+                self.assertFalse(afk_conan.run_farm_workflow(status=self.status))
+        self.now = 900
+        self.status.check_inactivity()
+        messages = self.messages()
+        self.assertEqual(sum("Farm workflow failed" in text for text in messages), 2)
+        self.assertIn("Possible stuck", messages[-1])
+
+    def test_interrupted_farm_logs_result_and_preserves_capture_recovery(self):
+        workflow = MagicMock()
+        workflow.run.side_effect = ScreenCaptureUnavailable("screen grab failed")
+        with patch.object(afk_conan, "create_farm_workflow", return_value=workflow), patch.object(
+            afk_conan, "stop_farm_screen_recording"
+        ) as stop_recording, self.assertRaises(ScreenCaptureUnavailable):
+            afk_conan.run_farm_workflow(status=self.status)
+        messages = self.messages()
+        self.assertIn("Farm workflow started", messages[0])
+        self.assertIn("Farm workflow interrupted (ScreenCaptureUnavailable)", messages[1])
+        stop_recording.assert_called_once_with(None)
+
+    def test_cancelled_farm_logs_cancellation(self):
+        stop_event = __import__("threading").Event()
+        stop_event.set()
+        workflow = MagicMock()
+        workflow.run.return_value = False
+        with patch.object(afk_conan, "create_farm_workflow", return_value=workflow):
+            self.assertFalse(afk_conan.run_farm_workflow(status=self.status, stop_event=stop_event))
+        self.assertIn("Farm workflow cancelled", self.messages()[-1])
+
+    def test_warning_occurs_at_fifteen_minutes_once_per_quiet_period(self):
+        self.status.set_stage(afk_conan.ConanStage.SCREEN_UNAVAILABLE)
+        self.now = 899
+        self.status.check_inactivity()
+        self.assertEqual(self.messages(), [])
+        self.now = 900
+        self.status.check_inactivity()
+        messages = self.messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("no match end or successful farm completion for 0h 15m 0s", messages[0])
+        self.assertIn("waiting for screen capture", messages[0])
+        self.now = 3600
+        self.status.check_inactivity()
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_progress_logs_recovery_and_rearms_warning(self):
+        self.now = 900
+        self.status.check_inactivity()
+        self.messages()
+        self.now = 901
+        self.status.record_match_finished()
+        messages = self.messages()
+        self.assertIn("Conan match ended", messages[-2])
+        self.assertIn("activity resumed", messages[-1])
+        self.now = 1800
+        self.status.check_inactivity()
+        self.assertEqual(len(self.messages()), 3)
+        self.now = 1801
+        self.status.check_inactivity()
+        self.assertIn("Possible stuck", self.messages()[-1])
+        self.assertEqual(len(self.messages()), 4)
+
+    def test_pause_suppresses_warning_and_resume_gets_a_fresh_window(self):
+        pause_event = __import__("threading").Event()
+        stop_event = __import__("threading").Event()
+
+        def command(text):
+            update = {"message": {"chat": {"id": 12345}, "text": text}}
+            with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "12345"}):
+                afk_conan.handle_telegram_command(update, self.status, pause_event, stop_event)
+
+        self.now = 800
+        command("/conanPause")
+        self.now = 3600
+        self.status.check_inactivity(paused=pause_event.is_set())
+        self.assertEqual(self.messages(), [])
+        command("/conanResume")
+        self.now = 4499
+        self.status.check_inactivity()
+        self.assertEqual(self.messages(), [])
+        self.now = 4500
+        self.status.check_inactivity()
+        self.assertIn("Possible stuck", self.messages()[-1])
+
+    def test_failed_delivery_retries_in_order_without_blocking_game_events(self):
+        self.send.side_effect = [False, True, True]
+        self.status.record_match_finished()
+        self.status.send_pending_notifications()
+        self.status.record_farm_started()
+        messages = self.messages()
+        self.assertEqual(messages[0], messages[1])
+        self.assertIn("Farm workflow started", messages[2])
+        self.status.send_pending_notifications()
+        self.assertEqual(self.send.call_count, 3)
+
+    def test_unconfigured_telegram_does_not_queue_logs_or_attempt_sends(self):
+        status = afk_conan.ConanStatus()
+        status.record_match_finished()
+        status.record_farm_started()
+        status.record_farm_finished("completed")
+        self.now = 1800
+        status.check_inactivity()
+        status.send_pending_notifications()
+        self.send.assert_not_called()
+
+    def test_monitor_checks_without_a_game_loop_and_flushes_shutdown_logs(self):
+        shutdown_event = MagicMock()
+        shutdown_event.is_set.return_value = False
+
+        def finish_wait(seconds):
+            self.status.record_farm_started()
+            self.status.record_farm_finished("cancelled")
+            return True
+
+        shutdown_event.wait.side_effect = finish_wait
+        self.now = 900
+        afk_conan.monitor_conan_activity(self.status, MagicMock(is_set=lambda: False), shutdown_event)
+        messages = self.messages()
+        self.assertIn("Possible stuck", messages[0])
+        self.assertIn("Farm workflow started", messages[1])
+        self.assertIn("Farm workflow cancelled", messages[2])
+
+
+class TelegramPollingRecoveryTests(unittest.TestCase):
+    def test_stop_command_still_works_after_ssl_failure_with_offset_preserved(self):
+        stop_event = __import__("threading").Event()
+        pause_event = __import__("threading").Event()
+        stats = MagicMock()
+        stats.telegram_update_offset.return_value = 77
+        update = {
+            "update_id": 78,
+            "message": {"chat": {"id": 12345}, "text": "/conanStop"},
+        }
+        responses = [
+            URLError(ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING")),
+            FakeResponse(json.dumps({"ok": True, "result": [update]}).encode()),
+            FakeResponse(json.dumps({"ok": True}).encode()),
+            FakeResponse(json.dumps({"ok": True, "result": []}).encode()),
+        ]
+        with patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_CHAT_ID": "12345",
+        }), patch.object(afk_conan, "urlopen", side_effect=responses) as connection, patch.object(
+            stop_event, "wait", return_value=False
+        ), patch("sys.stderr", new_callable=io.StringIO), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            afk_conan.poll_telegram_commands(
+                afk_conan.ConanStatus(), pause_event, stop_event, stats
+            )
+        self.assertTrue(stop_event.is_set())
+        stats.record_telegram_update.assert_called_once_with(79)
+        requests = [parse_qs(item.args[0].data.decode()) for item in connection.call_args_list]
+        self.assertEqual(requests[0]["offset"], ["77"])
+        self.assertEqual(requests[1]["offset"], ["77"])
+        self.assertEqual(requests[3]["offset"], ["79"])
+
+    def test_ssl_eof_retries_with_backoff_and_resets_after_recovery(self):
+        stop_event = __import__("threading").Event()
+        attempts = 0
+        outcomes = iter((
+            ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING"),
+            URLError(ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING")),
+            None,
+            ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING"),
+            None,
+        ))
+
+        def connection_attempt(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            outcome = next(outcomes)
+            if outcome is not None:
+                raise outcome
+            if attempts == 5:
+                stop_event.set()
+            return FakeResponse(json.dumps({"ok": True, "result": []}).encode())
+
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}), patch.object(
+            afk_conan, "urlopen", side_effect=connection_attempt
+        ), patch.object(stop_event, "wait", return_value=False) as wait, patch(
+            "sys.stderr", new_callable=io.StringIO
+        ) as errors, patch("sys.stdout", new_callable=io.StringIO) as output:
+            afk_conan.poll_telegram_commands(
+                afk_conan.ConanStatus(), __import__("threading").Event(), stop_event
+            )
+
+        self.assertEqual(attempts, 5)
+        self.assertEqual(wait.call_args_list, [call(5), call(10), call(5)])
+        self.assertIn("retrying in 10 seconds", errors.getvalue())
+        self.assertEqual(output.getvalue().count("Telegram command polling recovered"), 2)
+        self.assertNotIn("test-token", errors.getvalue() + output.getvalue())
+
+    def test_repeated_failures_are_capped_and_stop_interrupts_the_wait(self):
+        stop_event = __import__("threading").Event()
+        waits = []
+
+        def stop_after_seven_failures(seconds):
+            waits.append(seconds)
+            if len(waits) == 7:
+                stop_event.set()
+                return True
+            return False
+
+        with patch.object(
+            afk_conan, "telegram_api_request",
+            side_effect=ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING"),
+        ) as request, patch.object(
+            stop_event, "wait", side_effect=stop_after_seven_failures
+        ), patch("sys.stderr", new_callable=io.StringIO):
+            afk_conan.poll_telegram_commands(
+                afk_conan.ConanStatus(), __import__("threading").Event(), stop_event
+            )
+        self.assertEqual(waits, [5, 10, 20, 40, 60, 60, 60])
+        self.assertEqual(request.call_count, 7)
 
 
 class ConanStatusTests(unittest.TestCase):

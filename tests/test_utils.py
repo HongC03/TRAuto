@@ -19,6 +19,18 @@ class ImageUtilityTests(unittest.TestCase):
         mock_gui.locateOnScreen.return_value = None
         mock_gui.center.return_value = (50, 60)
 
+    def test_capture_backend_is_shared_and_restored_after_failure(self):
+        capture = MagicMock()
+        capture.locate.return_value = (10, 20, 30, 40)
+        with self.assertRaisesRegex(RuntimeError, "test failure"):
+            with utils.use_screen_capture(capture):
+                self.assertEqual(utils.locate_on_screen("conan.png"), (10, 20, 30, 40))
+                utils.capture_screen(region=(10, 20, 30, 40))
+                raise RuntimeError("test failure")
+        capture.screenshot.assert_called_once_with(region=(10, 20, 30, 40))
+        utils.locate_on_screen("conan.png")
+        mock_gui.locateOnScreen.assert_called_once_with("conan.png", confidence=0.89)
+
     def test_auto_press_button_uses_interval_until_stopped(self):
         def stop_after_three_presses():
             return mock_key.press.call_count >= 3

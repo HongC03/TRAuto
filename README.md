@@ -67,6 +67,40 @@ Only the configured `TELEGRAM_CHAT_ID` is accepted. Telegram polling is
 disabled when credentials are missing. Statistics and the next scheduled farm
 time are persisted in `conan_stats.json`.
 
+When Telegram is configured, Conan sends timestamped logs for each detected
+match end and each farm workflow's start and outcome (completed, failed,
+cancelled, or interrupted). Logs are sent in the background; failed sends are
+retried without blocking game automation.
+
+An independent watchdog sends a possible-stuck warning after 15 minutes without
+a match end or a successful farm completion, including the current stage and
+last completed activity. Failed farm attempts do not reset the timer. It sends
+one warning per quiet period and a recovery message when progress resumes.
+`/conanPause` suppresses these warnings; `/conanResume` starts a fresh 15-minute
+window. Capture failures remain eligible for warnings.
+
+Transient Telegram polling failures (including SSL unexpected EOF) are retried
+after 5 seconds, backing off to 10, 20, 40, then at most 60 seconds for repeated
+failures. A successful poll resets the delay and prints a recovery message.
+Game automation continues independently, and pending activity messages remain
+queued for delivery when Telegram connectivity returns.
+
+### Running with the monitor powered off
+
+Conan automation uses live desktop screenshots and falls back to capturing the
+Tales Runner window when the desktop capture fails, is black, or the game moves
+outside the primary display. Window capture requires Pillow 11.2.1 or newer.
+If both captures are unavailable, the script stays running, keeps Telegram
+commands available, and retries every `CONAN_LOOP_INTERVAL` seconds. The status
+shows `waiting for screen capture`; automation resumes when frames return.
+
+The game must keep rendering and Windows must retain a usable desktop for mouse
+and keyboard input. If physically powering off the monitor disconnects the only
+display and stops game rendering, software retries cannot supply those frames.
+Keep the display connection active through the monitor's standby/hot-plug
+settings, or use a display emulator/dummy plug in that case. The PC must remain
+awake and the Windows session unlocked. No previous screenshot is reused.
+
 ## Farm workflow
 
 Farm automation is enabled by default and runs on the configured schedule. When

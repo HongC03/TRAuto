@@ -2,13 +2,39 @@
 
 import random
 import time
+from contextlib import contextmanager
 
 import pyautogui as gui
 import pydirectinput as key
 
+_screen_capture = None
+
+
+@contextmanager
+def use_screen_capture(capture):
+    """Share a capture backend with this run's automation and Telegram threads."""
+    global _screen_capture
+    previous = _screen_capture
+    _screen_capture = capture
+    try:
+        yield
+    finally:
+        _screen_capture = previous
+
+
+def capture_screen(region=None):
+    """Capture through the active backend, or use the default desktop capture."""
+    if _screen_capture is not None:
+        return _screen_capture.screenshot(region=region)
+    if region is None:
+        return gui.screenshot()
+    return gui.screenshot(region=region)
+
 
 def locate_on_screen(image_path, confidence=0.89, region=None):
     """Locate an image on the primary screen or an optional region."""
+    if _screen_capture is not None:
+        return _screen_capture.locate(image_path, confidence=confidence, region=region)
     if region is None:
         return gui.locateOnScreen(
             str(image_path),

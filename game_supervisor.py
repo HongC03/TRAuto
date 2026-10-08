@@ -16,7 +16,7 @@ import pyautogui as gui
 import pydirectinput as key
 import pygetwindow as gw
 
-from utils import locate_on_screen, pressButton, triggerIfDetected
+from utils import capture_screen, locate_on_screen, pressButton, triggerIfDetected
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -102,7 +102,7 @@ def stateYZM(find, region=None):
         int(73),
         int(48)
     )
-    verification_image = gui.screenshot(region=verification_region)
+    verification_image = capture_screen(region=verification_region)
 
     for _ in range(5):
         pixels = np.array(verification_image)
